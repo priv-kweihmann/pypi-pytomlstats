@@ -1,0 +1,111 @@
+#!/usr/bin/env python3
+
+## SPDX-License-Identifier: MIT
+## Copyright (c) 2022, Konrad Weihmann
+
+import glob
+import io
+import itertools
+import json
+import multiprocessing as mp
+import os
+import subprocess
+import tarfile
+import tempfile
+import zipfile
+from typing import Dict
+from typing import List
+
+import requests
+import toml
+
+
+def get_all_packages() -> List[str]:
+    try:
+        return subprocess.check_output(['qypi', 'list'], universal_newlines=True, stderr=subprocess.DEVNULL).split('\n')
+    except subprocess.CalledProcessError:
+        return []
+
+
+def get_latest_release(pkg: str) -> str:
+    try:
+        jobj = json.loads(subprocess.check_output(
+            ['qypi', 'files', pkg], universal_newlines=True, stderr=subprocess.DEVNULL))
+        for _file in jobj[0]['files']:
+            if _file.get('yanked', False):
+                continue
+            if _file.get('packagetype', '') == 'sdist':
+                return _file['url']
+    except Exception:
+        return None
+
+
+def download_and_unpack(pkgurl: str) -> str:
+    if not pkgurl:
+        return ''
+    response = requests.get(pkgurl, stream=True)
+    if pkgurl.endswith('.tar.gz'):
+        file = tarfile.open(fileobj=response.raw, mode="r|gz")
+    elif pkgurl.endswith('.tar.bz2'):
+        file = tarfile.open(fileobj=response.raw, mode="r|bz2")
+    elif pkgurl.endswith('.zip'):
+        file = zipfile.ZipFile(io.BytesIO(response.content))
+    else:
+        print(f'No support for {pkgurl}')
+        return ''
+    try:
+        path = tempfile.mkdtemp()
+        file.extractall(path)
+        return path
+    except:
+        return ''
+
+
+def search_and_parse_toml_bb(path: str) -> List[Dict]:
+    res = set()
+    if not path:
+        return res
+    for item in glob.glob(os.path.join(path, '*', 'pyproject.toml')):
+        with open(item) as i:
+            bb = toml.load(i).get('build-system', {}).get('build-backend', '')
+            if bb:
+                res.add(bb)
+    return sorted(res)
+
+
+def gather_stats(pkg: str, bbs: List[str], global_stats: Dict) -> None:
+    for key_ in bbs:
+        if key_ not in global_stats:
+            global_stats[key_] = set()
+        global_stats[key_].add(pkg)
+
+
+def get_toml(pkg):
+    try:
+        print(f'Reading package {pkg}')
+        path = download_and_unpack(get_latest_release(pkg))
+        return (search_and_parse_toml_bb(path), pkg)
+    except:
+        return ([], pkg)
+
+
+def main():
+    stats = {}
+
+    results = []
+    with mp.Pool(processes=20) as pool:
+        results = [pool.apply(get_toml, args=(pkg, ))
+                   for pkg in get_all_packages() if pkg.strip()]
+
+    for res in results:
+        gather_stats(res[1], res[0], stats)
+
+    print('###### RESULTS ########')
+    total_ = float(len(list(itertools.chain(*stats.values()))))
+    for k, v in stats.items():
+        print(f'{k} is used by { len(v) } items {len(v) / total_:.2f}/1.0')
+        print(f'   items are {sorted(v)}')
+
+
+if __name__ == '__main__':
+    main()
